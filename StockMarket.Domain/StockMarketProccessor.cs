@@ -1,8 +1,10 @@
-﻿using StockMarket.Domain.Comparers;
+﻿using StockMarket.Domain.States;
+using Microsoft.VisualBasic;
+using StockMarket.Domain.Comparers;
 
 namespace StockMarket.Domain
 {
-    public class StockMarketProccessor
+    public class StockMarketProccessor : IStockMarketProccessor
     {
         private long lastOrderId;
         private long lastTradeId;
@@ -10,6 +12,7 @@ namespace StockMarket.Domain
         private readonly List<Trade> trades;
         private readonly PriorityQueue<Order, Order> buyOrders;
         private readonly PriorityQueue<Order, Order> sellOrders;
+        public MarketState state;
 
         public IEnumerable<Order> Orders => orders;
         public IEnumerable<Trade> Trades => trades;
@@ -21,41 +24,96 @@ namespace StockMarket.Domain
             trades = new();
             buyOrders = new(new MaxComparer());
             sellOrders = new(new MinComparer());
+            state = new OpenState(this);
+
         }
 
-        public long EnqueueOrder(TradeSide tradeSide, decimal quantity, decimal price)
+        internal long Enqueue(TradeSide tradeSide, decimal quantity, decimal price)
         {
             Interlocked.Increment(ref lastOrderId);
-            var order = new Order(lastTradeId, tradeSide, quantity, price);
+            var order = new Order(lastOrderId, tradeSide, quantity, price);
             orders.Add(order);
+
             if (tradeSide == TradeSide.Buy) matchOrder(order, buyOrders, sellOrders, (decimal price1, decimal price2) => price1 >= price2);
             else matchOrder(order, sellOrders, buyOrders, (decimal price1, decimal price2) => price1 <= price2);
             return order.Id;
         }
-
-        private void matchOrder(Order order, PriorityQueue<Order, Order> orders, PriorityQueue<Order, Order> matchingOrders, Func<decimal, decimal, bool> comparePriceDelegate)
+        public long EnqueueOrder(TradeSide tradeSide, decimal quantity, decimal price)
         {
-            while (matchingOrders.Count > 0 && order.Quantity > 0 && comparePriceDelegate(order.Price, matchingOrders.Peek().Price))
+            return state.EnqueueOrder(tradeSide, quantity, price);
+        }
+
+        internal long Cancel(long orderId)
+        {
+            var order = orders.Single(order => order.Id == orderId);
+            order.Cancel();
+            return order.Id;
+        }
+        public long? CancelOrder(long orderId)
+        {
+            return state.CancelOrder(orderId);
+        }
+
+        internal void Close()
+        {
+            state = new CloseState(this);
+        }
+        public void CloseMarket()
+        {
+            state.CloseMarket();
+        }
+
+        internal void Open()
+        {
+            state = new OpenState(this);
+        }
+        public void OpenMarket()
+        {
+            state.OpenMarket();
+        }
+
+        internal long Modify(long orderId, TradeSide tradeSide, decimal quantity, decimal price)
+        {
+            this.Cancel(orderId);
+            return EnqueueOrder(tradeSide, quantity, price);
+
+        }
+        public long ModifyOrder(long orderId, TradeSide tradeSide, decimal quantity, decimal price)
+        {
+            return state.ModifyOrder(orderId, tradeSide, quantity, price);
+        }
+
+        private void matchOrder(Order order, PriorityQueue<Order, Order> orders, PriorityQueue<Order, Order> matchingOrders, Func<decimal, decimal, bool> comparePriceDeligate)
+        {
+            while (matchingOrders.Count > 0 && order.Quantity > 0 && comparePriceDeligate(order.Price, matchingOrders.Peek().Price))
             {
                 var peekedOrder = matchingOrders.Peek();
+                if (peekedOrder.IsCanceled)
+                {
+                    matchingOrders.Dequeue();
+                    continue;
+                }
                 makeTrade(order, peekedOrder);
+                if (peekedOrder.Quantity == 0) matchingOrders.Dequeue();
             }
+
             if (order.Quantity > 0) orders.Enqueue(order, order);
         }
 
         private void makeTrade(Order order1, Order order2)
         {
-            var matchingOrder = FindOrders(order1, order2);
-            var buyOrder = matchingOrder.BuyOrder;
-            var sellOrder = matchingOrder.SellOrder;
-            decimal minQuantity = Math.Min(buyOrder.Quantity, sellOrder.Quantity);
+            var matchingOrders = FindOrders(order1, order2);
+            var buyOrder = matchingOrders.BuyOrder;
+            var sellOrder = matchingOrders.SellOrder;
+
+            decimal minQuantity = Math.Min(sellOrder.Quantity, buyOrder.Quantity);
+
             Interlocked.Increment(ref lastTradeId);
             var trade = new Trade(lastTradeId, buyOrder.Id, sellOrder.Id, minQuantity, sellOrder.Price);
             trades.Add(trade);
 
-            buyOrder.decreaseQuantity(minQuantity);
-            sellOrder.decreaseQuantity(minQuantity);
-
+            buyOrder.DecreaseQuantity(minQuantity);
+            sellOrder.DecreaseQuantity(minQuantity);
         }
 
         private static (Order BuyOrder, Order SellOrder) FindOrders(Order order1, Order order2)
